@@ -43,7 +43,7 @@ class CMakeBuild(build_ext):
             shutil.copy2(built_lib, src_package_dir)
 
 setup(
-    name='jax-mlx',
+    name='jax-mlx-plugin',
     version='0.0.1',
     author='Thomas Summe',
     description='JAX PJRT plugin for Apple Silicon using MLX',

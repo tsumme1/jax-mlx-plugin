@@ -3,7 +3,7 @@ requires = ["setuptools>=42", "wheel", "pybind11", "cmake", "mlx"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jax-mlx"
+name = "jax-mlx-plugin"
 version = "0.0.1"
 description = "JAX PJRT plugin for Apple Silicon using MLX"
 readme = "README.md"
@@ -36,6 +36,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/tsumme1/jax-mlx"
 Repository = "https://github.com/tsumme1/jax-mlx"
+PyPI = "https://pypi.org/project/jax-mlx-plugin/"
 
 [project.entry-points."jax_plugins"]
 mlx_plugin = "jax_mlx.plugin"

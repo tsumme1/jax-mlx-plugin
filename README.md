@@ -1,4 +1,6 @@
-# JAX MLX
+# JAX MLX Plugin
+
+[![PyPI](https://img.shields.io/pypi/v/jax-mlx-plugin)](https://pypi.org/project/jax-mlx-plugin/)
 
 A PJRT plugin enabling JAX to use Apple's MLX framework as a backend on Apple Silicon Macs.
 
