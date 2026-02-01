@@ -1,0 +1,15 @@
+# Include CMake and C++ source files for building the extension
+include CMakeLists.txt
+recursive-include src *.cpp *.h
+recursive-include third_party *.h
+
+# Include documentation
+include README.md
+include LICENSE
+
+# Exclude build artifacts
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude *.dylib
+prune benchmarks/build
