@@ -44,7 +44,7 @@ class CMakeBuild(build_ext):
 
 setup(
     name='jax-mlx-plugin',
-    version='0.0.1',
+    version='0.0.2',
     author='Thomas Summe',
     description='JAX PJRT plugin for Apple Silicon using MLX',
     long_description=open('README.md').read(),

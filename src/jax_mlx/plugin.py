@@ -41,6 +41,10 @@ def initialize():
     else:
         print("[MLX-Plugin] Library not found!")
         raise RuntimeError("MLX PJRT library not found")
+    
+    # Register SDPA lowering separately, after plugin is registered
+    # This must succeed independently of linalg registration
+    _register_sdpa_lowering()
 
 
 def _register_linalg_lowerings():
@@ -104,3 +108,33 @@ def _register_linalg_lowerings():
             mlir.register_lowering(eig_p, eig_lower, platform="mlx")
     except Exception as e:
         print(f"[MLX-Plugin] Warning: Could not register eig_p: {e}")
+
+
+def _register_sdpa_lowering():
+    """Register SDPA lowering and monkey-patch jax.nn.dot_product_attention."""
+    try:
+        from jax_mlx.sdpa import _register_mlx_sdpa_lowering
+        _register_mlx_sdpa_lowering()
+    except Exception as e:
+        print(f"[MLX-Plugin] Warning: Could not register SDPA MLIR lowering: {e}")
+    
+    try:
+        from jax_mlx.sdpa import patch_jax_dot_product_attention
+        patch_jax_dot_product_attention()
+    except Exception as e:
+        print(f"[MLX-Plugin] Warning: Could not patch dot_product_attention: {e}")
+
+    # Register LayerNorm lowering and monkey-patch
+    try:
+        from jax_mlx.layer_norm import _register_mlx_layer_norm_lowering
+        _register_mlx_layer_norm_lowering()
+    except Exception as e:
+        print(f"[MLX-Plugin] Warning: Could not register LayerNorm MLIR lowering: {e}")
+    
+    try:
+        from jax_mlx.layer_norm import patch_flax_layer_norm
+        patch_flax_layer_norm()
+    except Exception as e:
+        print(f"[MLX-Plugin] Warning: Could not patch LayerNorm: {e}")
+
+

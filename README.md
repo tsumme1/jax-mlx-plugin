@@ -1,89 +1,95 @@
 # JAX MLX Plugin
 
 [![PyPI](https://img.shields.io/pypi/v/jax-mlx-plugin)](https://pypi.org/project/jax-mlx-plugin/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A PJRT plugin enabling JAX to use Apple's MLX framework as a backend on Apple Silicon Macs.
-
-## Status
-
-✅ **362 ops tested and passing**
-
+A [PJRT](https://openxla.org/xla/pjrt_integration) plugin that lets **JAX run on Apple Silicon GPUs** via [MLX](https://github.com/ml-explore/mlx). Write standard JAX code — the plugin handles compilation to Metal compute kernels automatically.
 
 ## Requirements
 
-- **Apple Silicon Mac** (M1/M2/M3/M4)
-- **Python:** 3.11+
-- **Dependencies:** jax, jaxlib, mlx
+- Apple Silicon Mac (M1/M2/M3/M4)
+- macOS 14.0+ (Sonoma)
+- Python 3.11+
 
 ## Installation
 
 ```bash
-# Install build dependencies
-pip install mlx jaxlib jax
+pip install jax-mlx-plugin
+```
 
-# Install the plugin
+Or from source:
+
+```bash
+git clone https://github.com/tsumme1/jax-mlx.git
+cd jax-mlx
 pip install .
 ```
 
-## Usage
+## Quick Start
 
 ```python
 import jax
 import jax.numpy as jnp
 
-# List available devices
-print(jax.devices())  # [mlx:0]
+print(jax.devices())  # [MlxDevice(id=0)]
 
-# Use MLX as default device
 mlx = jax.devices('mlx')[0]
 with jax.default_device(mlx):
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.sin(x) + jnp.cos(x)
-    print(y)
+    print(y)  # runs on Metal GPU
 ```
 
-## Features
+## What Works
 
-- ✅ All core JAX operations (362 tested)
-- ✅ Full autodiff support (`jax.grad`, `jax.value_and_grad`)
-- ✅ JIT compilation with `mx.compile()` kernel fusion
-- ✅ Vectorization (`jax.vmap`)
-- ✅ Control flow (`lax.cond`, `lax.while_loop`, `lax.scan`)
-- ✅ Linear algebra, FFT, convolutions
-- ✅ Neural network training (Flax, Optax)
+| Category | Details |
+|----------|---------|
+| **Core ops** | Arithmetic, math, reductions, comparisons, bitwise, type conversion |
+| **Autodiff** | `jax.grad`, `value_and_grad`, `jacfwd`, `jacrev`, `hessian` |
+| **Transforms** | `jax.jit`, `jax.vmap` |
+| **Control flow** | `lax.cond`, `lax.switch`, `lax.while_loop`, `lax.scan`, `lax.fori_loop`, `lax.map`, `lax.associative_scan` |
+| **Linear algebra** | `matmul`, `solve`, `inv`, `cholesky`, `qr`, `svd`, `eig`, `eigh`, `triangular_solve`, `slogdet` |
+| **Neural networks** | Flax + Optax (CNNs, MLPs, RNNs, Transformers verified) |
+| **Convolutions** | `conv_general_dilated` (NHWC/NCHW), pooling (max/min/avg + gradients) |
+| **FFT** | `fft`, `ifft`, `rfft`, `irfft`, 2D variants |
+| **Distributions** | `jax.random.*` (Threefry PRNG with 64-bit emulation on Metal) |
+| **SciPy** | `scipy.special`, `scipy.linalg`, `scipy.stats`, `scipy.signal`, `scipy.ndimage` |
 
-## Environment Variables
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical details.
 
-| Variable | Description |
-|----------|-------------|
-| `MLX_PJRT_DEBUG=1` | Enable verbose debug logging |
-| `MLX_NO_COMPILE=1` | Disable mx.compile() kernel fusion |
-| `MLX_TIMING=1` | Enable timing output |
+## Benchmarks
 
-## Development
+Four benchmark suites compare JAX-MLX against JAX CPU and native MLX:
+
+| Benchmark | Command |
+|-----------|---------|
+| CNN (Conv + Pool + Dense) | `python benchmarks/benchmark_cnn.py` |
+| MLP (Dense layers) | `python benchmarks/benchmark_mlp.py` |
+| RNN (Recurrent) | `python benchmarks/benchmark_rnn.py` |
+| Transformer (Attention) | `python benchmarks/benchmark_transformer.py` |
+
+Each also has a `_native.py` variant for direct MLX comparison.
+
+## Testing
 
 ```bash
-# Run exhaustive tests (362 ops)
+# Exhaustive op coverage (387 ops)
 python tests/test_exhaustive.py
 
-# Run CNN benchmarks
-python benchmarks/benchmark_cnn.py           # JAX/Flax
-python benchmarks/benchmark_mlx_native.py    # Native MLX Python
+# Every op wrapped in lax.while_loop (362 ops)
+python tests/test_exhaustive_while.py
 
-# Build and run C++ benchmark
-cd benchmarks && cmake -B build && cmake --build build
-./build/mlx_cpp_benchmark
+# Compilation tier coverage
+python tests/test_compilation_coverage.py
 ```
-
-## Architecture
-
-The plugin implements the PJRT (Portable JAX Runtime) C API. StableHLO operations from JAX are parsed and converted to MLX operations at runtime using a lightweight MLIR parser. The plugin uses `mx.compile()` for GPU kernel fusion.
 
 ## Known Limitations
 
-- **Float64:** Not supported on Metal GPU (use Float32)
-- **While loops:** Block kernel fusion (require runtime eval)
+- **Float64** — Not natively supported on Metal; use Float32
+- **While loops** — Block kernel fusion for the enclosing graph (segments within are still compiled)
+- **LAPACK ops** — LU factorization, slogdet use CPU interpreter fallback
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).

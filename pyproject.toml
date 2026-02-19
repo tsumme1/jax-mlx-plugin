@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-mlx-plugin"
-version = "0.0.1"
+version = "0.0.2"
 description = "JAX PJRT plugin for Apple Silicon using MLX"
 readme = "README.md"
 license = {text = "MIT"}

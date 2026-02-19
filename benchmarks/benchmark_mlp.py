@@ -1,9 +1,9 @@
 """
-CNN Training Benchmark: JAX-MLX
+MLP Training Benchmark: JAX-MLX
 Full training loop with forward + backward + SGD.
 
 Usage:
-  python benchmarks/benchmark_cnn.py
+  python benchmarks/benchmark_mlp.py
 """
 
 import os
@@ -21,31 +21,20 @@ import time
 import numpy as np
 
 
-class SimpleCNN(nn.Module):
-    """Deep CNN for benchmarking."""
+class MLP(nn.Module):
+    """Deep wide MLP for benchmarking."""
 
     @nn.compact
     def __call__(self, x):
-        # Block 1
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Dense(features=8192)(x)
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Dense(features=4096)(x)
         x = nn.relu(x)
-        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-
-        # Block 2
-        x = nn.Conv(features=128, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Dense(features=4096)(x)
         x = nn.relu(x)
-        x = nn.Conv(features=128, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Dense(features=2048)(x)
         x = nn.relu(x)
-        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-
-        # Block 3
-        x = nn.Conv(features=256, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-
-        x = jnp.mean(x, axis=(1, 2))  # Global average pooling
-        x = nn.Dense(features=128)(x)
+        x = nn.Dense(features=1024)(x)
         x = nn.relu(x)
         x = nn.Dense(features=10)(x)
         return x
@@ -67,16 +56,15 @@ def create_train_step(model, lr=0.01):
     return train_step
 
 
-def benchmark_mlx(batch_size=128, image_size=64, num_warmup=30, num_runs=20):
-    """Benchmark CNN training on MLX."""
+def benchmark_mlx(batch_size=2048, input_dim=2048, num_warmup=30, num_runs=20):
+    """Benchmark MLP training on MLX."""
     try:
         mlx = jax.devices("mlx")[0]
     except Exception as e:
         print(f"MLX device not available: {e}")
         return None, None
 
-    model = SimpleCNN()
-    input_shape = (batch_size, image_size, image_size, 3)
+    model = MLP()
 
     try:
         cpu = jax.devices("cpu")[0]
@@ -85,9 +73,9 @@ def benchmark_mlx(batch_size=128, image_size=64, num_warmup=30, num_runs=20):
 
     with jax.default_device(cpu):
         rng = jax.random.PRNGKey(0)
-        params = model.init(rng, jnp.ones(input_shape))
+        params = model.init(rng, jnp.ones((batch_size, input_dim)))
         key = jax.random.PRNGKey(42)
-        x = jax.random.normal(key, input_shape)
+        x = jax.random.normal(key, (batch_size, input_dim))
         y = jax.random.randint(key, (batch_size,), 0, 10)
 
     with jax.default_device(mlx):
@@ -123,15 +111,15 @@ def benchmark_mlx(batch_size=128, image_size=64, num_warmup=30, num_runs=20):
 
 
 def main():
-    batch_size = 128
-    image_size = 64
+    batch_size = 2048
+    input_dim = 2048
 
-    print("CNN Training Benchmark (JAX-MLX)")
-    print(f"Config: batch_size={batch_size}, image_size={image_size}x{image_size}x3")
-    print(f"Model: Conv(64)×2 → Pool → Conv(128)×2 → Pool → Conv(256) → GAP → Dense(128) → Dense(10)")
+    print("MLP Training Benchmark (JAX-MLX)")
+    print(f"Config: batch_size={batch_size}, input_dim={input_dim}")
+    print(f"Model: Dense(1024→8192→4096→4096→2048→1024→10) + ReLU")
     print(f"Task: Forward + Backward pass with SGD\n")
 
-    mean, std = benchmark_mlx(batch_size, image_size)
+    mean, std = benchmark_mlx(batch_size, input_dim)
 
     if mean is not None:
         print(f"\n{'='*50}")

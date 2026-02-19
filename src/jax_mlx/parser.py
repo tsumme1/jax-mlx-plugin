@@ -152,17 +152,6 @@ def parse_bytecode(bytecode):
                     from jaxlib import xla_client
                     bytecode_text = xla_client._xla.mlir.deserialize_portable_artifact(bytecode)
                     if _DEBUG: print("[MLX-Parser]   Deserialized portable artifact successful", flush=True)
-                    # Debug: print while body contents (disabled - was causing issues)
-                    # if "stablehlo.while" in bytecode_text:
-                    #     lines = bytecode_text.split('\n')
-                    #     in_body = False
-                    #     for line in lines:
-                    #         if "} do {" in line:
-                    #             in_body = True
-                    #         if in_body:
-                    #             print(f"[MLX-Parser] BODY: {line}")
-                    #             if "stablehlo.return" in line:
-                    #                 break
                     module_op = ir.Module.parse(bytecode_text, context=ctx)
                 except Exception as e:
                     if _DEBUG: print(f"[MLX-Parser]   Portable deserialization failed: {e}, trying raw parse", flush=True)
@@ -254,6 +243,10 @@ def parse_bytecode(bytecode):
             
             for inner_op in block.operations:
                 op_name = inner_op.operation.name
+                
+                # Rename sdy.* ops to passthrough (same as C++ parser)
+                if op_name.startswith("sdy."):
+                    op_name = "sdy_passthrough"
                 
                 # Terminator
                 if op_name in ["func.return", "stablehlo.return", "mhlo.return"]:
@@ -375,8 +368,11 @@ def parse_bytecode(bytecode):
                                      else: vals.append(x)
                                  # Success - process as normal
                                  if attr_name == "value":
-                                     if "Int" in type_str:
-                                         node["attributes"]["int_value"] = vals
+                                     # Check for int or bool types - both go to int_value
+                                     if "Int" in type_str or "Bool" in type_str or "i1" in type_str:
+                                         # Convert bool values to int for C++ compatibility
+                                         int_vals = [int(v) if isinstance(v, bool) else v for v in vals]
+                                         node["attributes"]["int_value"] = int_vals
                                          node["attributes"]["value_type"] = "dense_int"
                                      else:
                                          node["attributes"]["value"] = vals
@@ -537,6 +533,42 @@ def parse_bytecode(bytecode):
                 result_graph["input_shapes"] = input_shapes
             except Exception as e:
                 if _DEBUG: print(f"[MLX-Parser] Failed to extract input signature: {e}", flush=True)
+            
+            # Extract output signature for deferred execution (mega compile)
+            try:
+                output_shapes = []
+                output_dtypes = []
+                ftype = main_func.type
+                for t in ftype.results:
+                    info = get_type_info(t)
+                    output_shapes.append(info.get("shape", []))
+                    output_dtypes.append(info.get("dtype", "f32"))
+                result_graph["output_shapes"] = output_shapes
+                result_graph["output_dtypes"] = output_dtypes
+            except Exception as e:
+                if _DEBUG: print(f"[MLX-Parser] Failed to extract output signature: {e}", flush=True)
+                # Fallback: extract from node output types
+                try:
+                    output_ids = result_graph.get("outputs", [])
+                    if output_ids:
+                        id_to_type = {}
+                        for node in result_graph.get("nodes", []):
+                            for j, out_id in enumerate(node.get("outputs", [])):
+                                if j < len(node.get("output_types", [])):
+                                    id_to_type[out_id] = node["output_types"][j]
+                        output_shapes = []
+                        output_dtypes = []
+                        for oid in output_ids:
+                            if oid in id_to_type:
+                                output_shapes.append(id_to_type[oid].get("shape", []))
+                                output_dtypes.append(id_to_type[oid].get("dtype", "f32"))
+                            else:
+                                output_shapes.append([])
+                                output_dtypes.append("f32")
+                        result_graph["output_shapes"] = output_shapes
+                        result_graph["output_dtypes"] = output_dtypes
+                except Exception as e2:
+                    if _DEBUG: print(f"[MLX-Parser] Fallback output extraction also failed: {e2}", flush=True)
         else:
             return {"error": "No main function found"}
 

@@ -6,22 +6,10 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0")
 
 # --- Dependencies ---
 
-# 1. Find Python and pybind11
+# 1. Find Python (for Python C API headers - used as fallback for bytecode conversion)
+# When running from JAX (Python), the plugin uses Python C API to convert MLIR bytecode to text.
+# When running from Julia/Reactant, dlsym finds MLIR C API symbols directly (no Python needed).
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
-
-# Get pybind11 cmake path from pip install
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
-    OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE PYBIND11_FIND_RESULT
-)
-if(NOT PYBIND11_FIND_RESULT EQUAL 0)
-    message(FATAL_ERROR "Could not find pybind11. Install with: pip install pybind11")
-endif()
-list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_DIR}")
-
-find_package(pybind11 REQUIRED)
 
 # 2. Find MLX from pip installation
 # The mlx package installs headers in site-packages/mlx/include
@@ -66,11 +54,10 @@ target_include_directories(mlx_pjrt_plugin PRIVATE
     ${Python3_INCLUDE_DIRS}
 )
 
-# Link against MLX and pybind11
+# Link against MLX (and Python for bytecode conversion fallback)
 target_link_libraries(mlx_pjrt_plugin   
     PRIVATE   
     ${MLX_LIB_DIR}/libmlx.dylib
-    pybind11::pybind11
 )
 
 # Set RPATH to find libmlx.dylib at runtime

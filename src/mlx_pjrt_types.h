@@ -48,6 +48,8 @@ enum class OpType : uint16_t {
     // Other
     CLAMP, SELECT, SORT, TOP_K, OPTIMIZATION_BARRIER, RNG_BIT_GENERATOR, FFT,
     REAL, IMAG, COMPLEX, IS_FINITE,
+    // Fused patterns (detected by OptimizeGraphPatterns)
+    SOFTMAX, LOGSUMEXP, NOP,
     OP_TYPE_COUNT
 };
 
