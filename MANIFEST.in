@@ -12,4 +12,6 @@ global-exclude __pycache__
 global-exclude *.py[cod]
 global-exclude *.so
 global-exclude *.dylib
-prune benchmarks/build
+prune benchmarks
+prune build
+prune mlx_bug_repro
