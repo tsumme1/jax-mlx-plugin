@@ -116,18 +116,10 @@ def _register_mlx_layer_norm_lowering():
         return result.results
 
     # Register forward lowering
-    mlir.register_lowering(mlx_layer_norm_p, layer_norm_lowering, platform='METAL')
-    try:
-        mlir.register_lowering(mlx_layer_norm_p, layer_norm_lowering, platform='mlx')
-    except NotImplementedError:
-        pass
+    mlir.register_lowering(mlx_layer_norm_p, layer_norm_lowering, platform='mlx')
 
     # Register backward lowering
-    mlir.register_lowering(mlx_layer_norm_bwd_p, layer_norm_bwd_lowering, platform='METAL')
-    try:
-        mlir.register_lowering(mlx_layer_norm_bwd_p, layer_norm_bwd_lowering, platform='mlx')
-    except NotImplementedError:
-        pass
+    mlir.register_lowering(mlx_layer_norm_bwd_p, layer_norm_bwd_lowering, platform='mlx')
 
     # Fallback lowerings for non-MLX platforms
     mlir.register_lowering(

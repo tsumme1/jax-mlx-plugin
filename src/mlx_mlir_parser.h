@@ -473,7 +473,7 @@ private:
                             if (arrow_pos != std::string::npos && 
                                 graph.nodes[parent_idx].output_shapes.empty()) {
                                 std::string output_type_str = trim(body_line.substr(arrow_pos + 2));
-                                std::regex tensor_regex(R"(tensor<([^>]+)>)");
+                                std::regex tensor_regex(R"(tensor<(.+?)>(?!>))");  // Handle nested types like complex<f32>
                                 std::sregex_iterator type_iter(output_type_str.begin(), output_type_str.end(), tensor_regex);
                                 std::sregex_iterator type_end;
                                 while (type_iter != type_end) {
@@ -740,8 +740,8 @@ private:
             if (paren_start != std::string::npos && paren_end != std::string::npos) {
                 std::string args_str = line.substr(paren_start + 1, paren_end - paren_start - 1);
                 
-                // Parse each: %iterArg = %c, %iterArg_0 = %cst
-                std::regex iter_arg_regex(R"(%([\w]+)\s*=\s*%([\w]+))");
+                // Parse each: %iterArg = %c, %iterArg_0 = %cst, %iterArg_15 = %21#4
+                std::regex iter_arg_regex(R"(%([\w]+)\s*=\s*%([\w#]+))");
                 auto iter_begin = std::sregex_iterator(args_str.begin(), args_str.end(), iter_arg_regex);
                 auto iter_end = std::sregex_iterator();
                 
@@ -758,6 +758,20 @@ private:
                     
                     if (input_id >= 0) {
                         op.inputs.push_back(input_id);
+                    } else {
+                        // Operand not found in ssa_map - this happens when
+                        // MLIR text has constants like %c_9 that weren't parsed yet
+                        // (e.g., defined later or in a parent scope).
+                        // We MUST still push an input to maintain positional alignment
+                        // between op.inputs and the body's input_ids (iter_arg_ids).
+                        int placeholder_id = next_id_++;
+                        ssa_map_[operand_key] = placeholder_id;
+                        op.inputs.push_back(placeholder_id);
+                        if (debug_enabled()) {
+                            std::cerr << "[MLX-PARSER] While operand " << operand_key 
+                                      << " not found in ssa_map, created placeholder ID " 
+                                      << placeholder_id << std::endl;
+                        }
                     }
                     
                     // Create IDs for the iterArg names - these will be used as 
@@ -1640,6 +1654,14 @@ private:
                 }
                 op.int_array_attrs["slice_sizes"] = sizes;
             }
+            
+            // operand_batching_dims = [0] (for batched gather)
+            auto op_batch = parse_bracket_ints(rhs, "operand_batching_dims");
+            if (!op_batch.empty()) op.int_array_attrs["operand_batching_dims"] = op_batch;
+            
+            // start_indices_batching_dims = [0]
+            auto si_batch = parse_bracket_ints(rhs, "start_indices_batching_dims");
+            if (!si_batch.empty()) op.int_array_attrs["start_indices_batching_dims"] = si_batch;
         }
 
         // For concatenate ops, parse inline "dim" / "dimension" attribute
@@ -1821,7 +1843,184 @@ private:
                             op.int_array_attrs["value"] = int_vals;
                         }
                     } else if (is_hex) {
-                        // Parse hex float literals (e.g. 0xFF800000 = -inf in IEEE 754)
+                        // Check for hex blob format: dense<"0xABCDEF..."> 
+                        // MLIR bytecode serializes large tensors as quoted hex blobs
+                        // where the hex string contains raw bytes (little-endian)
+                        // Each 8 hex chars = 4 bytes = 1 float32/int32 element
+                        bool is_hex_blob = false;
+                        size_t hex_blob_start = std::string::npos;
+                        {
+                            // Strip leading/trailing whitespace and quotes
+                            std::string trimmed_val = value_str;
+                            size_t qs = trimmed_val.find('"');
+                            if (qs != std::string::npos) {
+                                size_t qe = trimmed_val.rfind('"');
+                                if (qe != std::string::npos && qe > qs) {
+                                    std::string inner = trimmed_val.substr(qs + 1, qe - qs - 1);
+                                    if (inner.size() > 2 && (inner.substr(0, 2) == "0x" || inner.substr(0, 2) == "0X")) {
+                                        // This is a hex blob: the entire string is raw bytes
+                                        is_hex_blob = true;
+                                        hex_blob_start = qs; // for reference
+                                        
+                                        std::string hex_data = inner.substr(2); // skip "0x"
+                                        
+                                        // Determine element type from the RHS string directly
+                                        // (output_dtypes not yet populated at this point)
+                                        // Look for ": tensor<...xTYPE>" in the full rhs
+                                        std::string out_dtype = "";
+                                        {
+                                            // Find the type annotation after the dense<...> value
+                                            size_t type_colon = rhs.rfind(": tensor<");
+                                            if (type_colon == std::string::npos) type_colon = rhs.rfind(":tensor<");
+                                            if (type_colon != std::string::npos) {
+                                                size_t type_gt = rhs.rfind('>');
+                                                if (type_gt != std::string::npos && type_gt > type_colon) {
+                                                    std::string tensor_type = rhs.substr(type_colon, type_gt - type_colon + 1);
+                                                    // Extract dtype: last segment after 'x' or just the type for scalars
+                                                    size_t last_x = tensor_type.rfind('x');
+                                                    if (last_x != std::string::npos) {
+                                                        out_dtype = tensor_type.substr(last_x + 1);
+                                                        // Remove trailing '>'
+                                                        size_t gt = out_dtype.find('>');
+                                                        if (gt != std::string::npos) out_dtype = out_dtype.substr(0, gt);
+                                                    } else {
+                                                        // Scalar tensor<f32>
+                                                        size_t lt = tensor_type.find('<');
+                                                        size_t gt2 = tensor_type.find('>');
+                                                        if (lt != std::string::npos && gt2 != std::string::npos)
+                                                            out_dtype = tensor_type.substr(lt + 1, gt2 - lt - 1);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        bool is_float_type = (out_dtype.find('f') != std::string::npos);
+                                        bool is_i8_type = (out_dtype == "i8" || out_dtype == "si8" || out_dtype == "int8");
+                                        bool is_i16_type = (out_dtype == "i16" || out_dtype == "si16" || out_dtype == "int16");
+                                        bool is_u8_type = (out_dtype == "ui8" || out_dtype == "uint8");
+                                        bool is_u16_type = (out_dtype == "ui16" || out_dtype == "uint16");
+                                        
+                                        // Bytes per element
+                                        int bytes_per_elem = 4; // default float32/int32
+                                        if (out_dtype.find("16") != std::string::npos) bytes_per_elem = 2;
+                                        else if (out_dtype.find("64") != std::string::npos) bytes_per_elem = 8;
+                                        else if (is_i8_type || is_u8_type) bytes_per_elem = 1;
+                                        
+                                        int hex_chars_per_elem = bytes_per_elem * 2;
+                                        
+                                        if (is_float_type) {
+                                            std::vector<float> float_vals;
+                                            float_vals.reserve(hex_data.size() / hex_chars_per_elem);
+                                            
+                                            // Parse hex blob byte-by-byte: each pair of hex chars 
+                                            // is one byte in memory order (native endianness)
+                                            for (size_t pos = 0; pos + hex_chars_per_elem <= hex_data.size(); pos += hex_chars_per_elem) {
+                                                try {
+                                                    if (bytes_per_elem == 4) {
+                                                        // Parse 4 bytes (8 hex chars) into raw byte buffer
+                                                        uint8_t bytes[4];
+                                                        for (int b = 0; b < 4; ++b) {
+                                                            std::string byte_str = hex_data.substr(pos + b * 2, 2);
+                                                            bytes[b] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                                                        }
+                                                        float f;
+                                                        std::memcpy(&f, bytes, sizeof(f));
+                                                        float_vals.push_back(f);
+                                                    } else if (bytes_per_elem == 2) {
+                                                        // f16/bf16: parse 2 bytes, convert to f32
+                                                        uint8_t bytes[2];
+                                                        for (int b = 0; b < 2; ++b) {
+                                                            std::string byte_str = hex_data.substr(pos + b * 2, 2);
+                                                            bytes[b] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                                                        }
+                                                        uint16_t bits;
+                                                        std::memcpy(&bits, bytes, sizeof(bits));
+                                                        // f16 -> f32 conversion
+                                                        uint32_t sign = (bits >> 15) & 0x1;
+                                                        uint32_t exp = (bits >> 10) & 0x1F;
+                                                        uint32_t mant = bits & 0x3FF;
+                                                        uint32_t f32_bits;
+                                                        if (exp == 0) {
+                                                            if (mant == 0) f32_bits = sign << 31;
+                                                            else {
+                                                                exp = 1;
+                                                                while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                                                                mant &= 0x3FF;
+                                                                f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                                                            }
+                                                        } else if (exp == 0x1F) {
+                                                            f32_bits = (sign << 31) | (0xFF << 23) | (mant << 13);
+                                                        } else {
+                                                            f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                                                        }
+                                                        float f;
+                                                        std::memcpy(&f, &f32_bits, sizeof(f));
+                                                        float_vals.push_back(f);
+                                                    } else if (bytes_per_elem == 8) {
+                                                        // f64: parse 8 bytes into raw byte buffer
+                                                        uint8_t bytes[8];
+                                                        for (int b = 0; b < 8; ++b) {
+                                                            std::string byte_str = hex_data.substr(pos + b * 2, 2);
+                                                            bytes[b] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                                                        }
+                                                        double d;
+                                                        std::memcpy(&d, bytes, sizeof(d));
+                                                        float_vals.push_back(static_cast<float>(d));
+                                                    }
+                                                } catch (...) {}
+                                            }
+                                            
+                                            if (!float_vals.empty()) {
+                                                op.float_array_attrs["value"] = float_vals;
+                                                if (debug_enabled()) {
+                                                    std::cerr << "[MLX-PARSER] Hex blob: parsed " << float_vals.size() 
+                                                              << " float values from " << hex_data.size() << " hex chars" << std::endl;
+                                                }
+                                            }
+                                        } else {
+                                            // Integer type
+                                            std::vector<int64_t> int_vals;
+                                            int_vals.reserve(hex_data.size() / hex_chars_per_elem);
+                                            
+                                            for (size_t pos = 0; pos + hex_chars_per_elem <= hex_data.size(); pos += hex_chars_per_elem) {
+                                                try {
+                                                    // Parse bytes individually for correct endianness
+                                                    uint8_t raw_bytes[8] = {0};
+                                                    for (int b = 0; b < bytes_per_elem; ++b) {
+                                                        std::string byte_str = hex_data.substr(pos + b * 2, 2);
+                                                        raw_bytes[b] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                                                    }
+                                                    if (bytes_per_elem <= 4) {
+                                                        uint32_t bits;
+                                                        std::memcpy(&bits, raw_bytes, sizeof(bits));
+                                                        // Sign-extend for signed types
+                                                        if (out_dtype.find('u') == std::string::npos && out_dtype.find('U') == std::string::npos) {
+                                                            if (bytes_per_elem == 1 && (bits & 0x80)) bits |= 0xFFFFFF00;
+                                                            else if (bytes_per_elem == 2 && (bits & 0x8000)) bits |= 0xFFFF0000;
+                                                        }
+                                                        int_vals.push_back(static_cast<int64_t>(static_cast<int32_t>(bits)));
+                                                    } else {
+                                                        uint64_t bits;
+                                                        std::memcpy(&bits, raw_bytes, sizeof(bits));
+                                                        int_vals.push_back(static_cast<int64_t>(bits));
+                                                    }
+                                                } catch (...) {}
+                                            }
+                                            
+                                            if (!int_vals.empty()) {
+                                                op.int_array_attrs["value"] = int_vals;
+                                                if (debug_enabled()) {
+                                                    std::cerr << "[MLX-PARSER] Hex blob: parsed " << int_vals.size() 
+                                                              << " int values from " << hex_data.size() << " hex chars" << std::endl;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (!is_hex_blob) {
+                        // Parse individual hex float literals (e.g. 0xFF800000 = -inf in IEEE 754)
                         // MLIR uses these for special values like -inf, inf, NaN
                         // Handle mixed hex+float constants like [1.0, 0x7FC00000, 2.0]
                         std::vector<float> float_vals;
@@ -1863,6 +2062,7 @@ private:
                         if (!float_vals.empty()) {
                             op.float_array_attrs["value"] = float_vals;
                         }
+                        } // end !is_hex_blob
                     } else if (is_float) {
 
                         // Parse as float array
@@ -1936,7 +2136,7 @@ private:
             
             // Handle tuple types: (tensor<...>, tensor<...>) for multiple outputs
             // Also handle simple type: tensor<...>
-            std::regex tensor_regex(R"(tensor<([^>]+)>)");
+            std::regex tensor_regex(R"(tensor<(.+?)>(?!>))");  // Handle nested types like complex<f32>
             std::sregex_iterator type_iter(output_type_str.begin(), output_type_str.end(), tensor_regex);
             std::sregex_iterator type_end;
             
@@ -1966,7 +2166,9 @@ private:
         // Only adds attributes not already parsed by op-specific parsers above.
         // IMPORTANT: Only scan the portion BEFORE the type separator " : " to avoid
         // matching numbers/brackets in type annotations like (tensor<1x1x5xf32>).
-        {
+        // SKIP for constant ops — they have no key=value attributes, and their dense<"0x...">
+        // hex blobs can be 30KB+, making regex catastrophically slow.
+        if (op.op_name != "stablehlo.constant" && op.op_name != "mhlo.constant") {
             // Extract the attribute region (before type annotation)
             std::string attr_region = rhs;
             size_t type_sep = rhs.find(" : ");
@@ -2061,6 +2263,11 @@ private:
     }
     
     std::string parseDtype(const std::string& shape_dtype) {
+        // Handle complex types first: "complex<f32>" or "2x3xcomplex<f32>"
+        size_t complex_pos = shape_dtype.find("complex");
+        if (complex_pos != std::string::npos) {
+            return shape_dtype.substr(complex_pos);  // "complex<f32>" or "complex<f64>"
+        }
         // Extract dtype from end of "2x3xf32" or just "f32"
         size_t last_x = shape_dtype.rfind('x');
         if (last_x != std::string::npos) {
@@ -2079,6 +2286,14 @@ private:
         while (iter != end) {
             std::string key = (*iter)[1].str();
             std::string value = trim((*iter)[2].str());
+            
+            // Skip keys already parsed by op-specific parsers above.
+            // The generic regex [^,}]+ truncates bracket-array values like
+            // stride = [2, 2] to just "[2", so we must not overwrite correct parses.
+            if (op.int_attrs.count(key) || op.int_array_attrs.count(key)) {
+                ++iter;
+                continue;
+            }
             
             // Try to parse as integer (handles both "1" and "1 : i64" / "1 : si64")
             try {

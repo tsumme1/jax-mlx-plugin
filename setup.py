@@ -36,15 +36,22 @@ class CMakeBuild(build_ext):
         subprocess.check_call(['cmake', ext.sourcedir] + cmake_args, cwd=self.build_temp)
         subprocess.check_call(['cmake', '--build', '.', '-j'] + build_args, cwd=self.build_temp)
         
+        # Ad-hoc codesign the built dylib (required on macOS, especially after OS updates)
+        built_lib = os.path.join(extdir, 'libmlx_pjrt_plugin.dylib')
+        if os.path.exists(built_lib) and sys.platform == 'darwin':
+            try:
+                subprocess.check_call(['codesign', '-fs', '-', built_lib])
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass  # codesign not available or failed — non-fatal
+        
         # Copy the built library to the package source directory as well
         src_package_dir = os.path.join(ext.sourcedir, 'src', 'jax_mlx')
-        built_lib = os.path.join(extdir, 'libmlx_pjrt_plugin.dylib')
         if os.path.exists(built_lib) and os.path.isdir(src_package_dir):
             shutil.copy2(built_lib, src_package_dir)
 
 setup(
     name='jax-mlx-plugin',
-    version='0.0.2',
+    version='0.0.3',
     author='Thomas Summe',
     description='JAX PJRT plugin for Apple Silicon using MLX',
     long_description=open('README.md').read(),

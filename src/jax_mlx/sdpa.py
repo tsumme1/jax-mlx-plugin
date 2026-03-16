@@ -129,18 +129,10 @@ def _register_mlx_sdpa_lowering():
         return result.results
 
     # Register forward lowering
-    mlir.register_lowering(mlx_sdpa_p, mlx_sdpa_lowering, platform='METAL')
-    try:
-        mlir.register_lowering(mlx_sdpa_p, mlx_sdpa_lowering, platform='mlx')
-    except NotImplementedError:
-        pass
+    mlir.register_lowering(mlx_sdpa_p, mlx_sdpa_lowering, platform='mlx')
 
     # Register backward lowering
-    mlir.register_lowering(mlx_sdpa_bwd_p, mlx_sdpa_bwd_lowering, platform='METAL')
-    try:
-        mlir.register_lowering(mlx_sdpa_bwd_p, mlx_sdpa_bwd_lowering, platform='mlx')
-    except NotImplementedError:
-        pass
+    mlir.register_lowering(mlx_sdpa_bwd_p, mlx_sdpa_bwd_lowering, platform='mlx')
 
     # Fallback lowerings for non-MLX platforms
     mlir.register_lowering(
