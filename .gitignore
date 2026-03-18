@@ -64,3 +64,8 @@ verify.txt
 
 # Scratch / temporary files
 tmp/
+
+# Agent workflow files and local notes (contain local paths)
+.agents/
+.gemini/
+bugs/
