@@ -7,11 +7,21 @@ recursive-include third_party *.h
 include README.md
 include LICENSE
 
-# Exclude build artifacts
+# Exclude build artifacts and local files
 global-exclude __pycache__
 global-exclude *.py[cod]
 global-exclude *.so
 global-exclude *.dylib
+global-exclude *.log
+global-exclude .DS_Store
 prune benchmarks
 prune build
+prune bugs
+prune tmp
 prune mlx_bug_repro
+prune .agents
+prune .gemini
+prune .pytest_cache
+prune .venv
+prune .idea
+prune .vscode
