@@ -1263,7 +1263,7 @@ private:
                     std::smatch pad_match;
                     if (std::regex_search(window_str, pad_match, pad_regex_2d)) {
                         std::vector<int64_t> padding;
-                        std::regex num_regex(R"(\d+)");
+                        std::regex num_regex(R"(-?\d+)");
                         // First dimension
                         std::string pad0_str = pad_match[1].str();
                         auto it0 = std::sregex_iterator(pad0_str.begin(), pad0_str.end(), num_regex);
@@ -1285,7 +1285,7 @@ private:
                         std::regex pad_regex_1d(R"(pad\s*=\s*\[\s*\[([^\]]*)\]\s*\])");
                         if (std::regex_search(window_str, pad_match, pad_regex_1d)) {
                             std::vector<int64_t> padding;
-                            std::regex num_regex(R"(\d+)");
+                            std::regex num_regex(R"(-?\d+)");
                             std::string pad0_str = pad_match[1].str();
                             auto it0 = std::sregex_iterator(pad0_str.begin(), pad0_str.end(), num_regex);
                             auto end = std::sregex_iterator();
@@ -1326,6 +1326,80 @@ private:
                             dilation.push_back(std::stoll(it->str()));
                             ++it;
                         }
+                        if (!dilation.empty()) op.int_array_attrs["rhs_dilation"] = dilation;
+                    }
+                }
+            }
+            
+            // Also handle generic format: <{window_strides = array<i64: 2, 2>, 
+            //   padding = dense<[[0, 1], [0, 1]]> : tensor<2x2xi64>,
+            //   lhs_dilation = array<i64: 1, 1>, rhs_dilation = array<i64: 1, 1>, ...}>
+            // This format is used when MLIR prints in generic syntax (e.g. for recompiled graphs)
+            size_t generic_start = rhs.find("<{");
+            size_t generic_end = rhs.find("}>"); 
+            if (generic_start != std::string::npos && generic_end != std::string::npos) {
+                std::string attr_block = rhs.substr(generic_start, generic_end - generic_start);
+                
+                // Parse window_strides = array<i64: 2, 2>
+                if (!op.int_array_attrs.count("stride") && !op.int_array_attrs.count("window_strides")) {
+                    std::regex stride_regex(R"(window_strides\s*=\s*array<i64:\s*([\d,\s]+)>)");
+                    std::smatch stride_match;
+                    if (std::regex_search(attr_block, stride_match, stride_regex)) {
+                        std::vector<int64_t> strides;
+                        std::regex num_regex(R"(\d+)");
+                        std::string nums = stride_match[1].str();
+                        auto it = std::sregex_iterator(nums.begin(), nums.end(), num_regex);
+                        auto end = std::sregex_iterator();
+                        for (; it != end; ++it) strides.push_back(std::stoll(it->str()));
+                        if (!strides.empty()) op.int_array_attrs["window_strides"] = strides;
+                    }
+                }
+                
+                // Parse padding = dense<[[0, 1], [0, 1]]> : tensor<2x2xi64>
+                if (!op.int_array_attrs.count("padding")) {
+                    std::regex pad_regex(R"(padding\s*=\s*dense<)");
+                    std::smatch pad_match;
+                    if (std::regex_search(attr_block, pad_match, pad_regex)) {
+                        size_t dense_start = attr_block.find("dense<", pad_match.position());
+                        size_t dense_end = attr_block.find(">", dense_start + 6);
+                        if (dense_start != std::string::npos && dense_end != std::string::npos) {
+                            std::string dense_content = attr_block.substr(dense_start + 6, dense_end - dense_start - 6);
+                            std::vector<int64_t> padding;
+                            std::regex num_regex(R"(-?\d+)");
+                            auto it = std::sregex_iterator(dense_content.begin(), dense_content.end(), num_regex);
+                            auto end = std::sregex_iterator();
+                            for (; it != end; ++it) padding.push_back(std::stoll(it->str()));
+                            if (!padding.empty()) op.int_array_attrs["padding"] = padding;
+                        }
+                    }
+                }
+                
+                // Parse lhs_dilation = array<i64: 2, 2>
+                if (!op.int_array_attrs.count("lhs_dilation")) {
+                    std::regex dil_regex(R"(lhs_dilation\s*=\s*array<i64:\s*([\d,\s]+)>)");
+                    std::smatch dil_match;
+                    if (std::regex_search(attr_block, dil_match, dil_regex)) {
+                        std::vector<int64_t> dilation;
+                        std::regex num_regex(R"(\d+)");
+                        std::string nums = dil_match[1].str();
+                        auto it = std::sregex_iterator(nums.begin(), nums.end(), num_regex);
+                        auto end = std::sregex_iterator();
+                        for (; it != end; ++it) dilation.push_back(std::stoll(it->str()));
+                        if (!dilation.empty()) op.int_array_attrs["lhs_dilation"] = dilation;
+                    }
+                }
+                
+                // Parse rhs_dilation = array<i64: 2, 2>
+                if (!op.int_array_attrs.count("rhs_dilation")) {
+                    std::regex dil_regex(R"(rhs_dilation\s*=\s*array<i64:\s*([\d,\s]+)>)");
+                    std::smatch dil_match;
+                    if (std::regex_search(attr_block, dil_match, dil_regex)) {
+                        std::vector<int64_t> dilation;
+                        std::regex num_regex(R"(\d+)");
+                        std::string nums = dil_match[1].str();
+                        auto it = std::sregex_iterator(nums.begin(), nums.end(), num_regex);
+                        auto end = std::sregex_iterator();
+                        for (; it != end; ++it) dilation.push_back(std::stoll(it->str()));
                         if (!dilation.empty()) op.int_array_attrs["rhs_dilation"] = dilation;
                     }
                 }

@@ -11,9 +11,7 @@ import os
 if "MLX_PJRT_DEBUG" in os.environ:
     del os.environ["MLX_PJRT_DEBUG"]
 if "JAX_PLATFORMS" not in os.environ:
-    os.environ["JAX_PLATFORMS"] = "cpu,mlx"
-elif "cpu" not in os.environ["JAX_PLATFORMS"]:
-    os.environ["JAX_PLATFORMS"] = "cpu," + os.environ["JAX_PLATFORMS"]
+    os.environ["JAX_PLATFORMS"] = "mlx"
 
 import jax
 import jax.numpy as jnp
@@ -121,29 +119,19 @@ class TransformerClassifier(nn.Module):
 def benchmark_mlx(batch_size=128, seq_len=64, d_model=256, num_warmup=30, num_runs=20):
     """Benchmark Transformer training on MLX."""
     try:
-        mlx = jax.devices("mlx")[0]
+        device = jax.devices("mlx")[0]
     except Exception as e:
         print(f"MLX device not available: {e}")
         return None, None
 
     model = TransformerClassifier(d_model=d_model, seq_len=seq_len)
 
-    try:
-        cpu = jax.devices("cpu")[0]
-    except Exception:
-        cpu = mlx
-
-    with jax.default_device(cpu):
+    with jax.default_device(device):
         rng = jax.random.PRNGKey(0)
         variables = model.init(rng, jnp.ones((batch_size, seq_len, d_model)))
         key = jax.random.PRNGKey(42)
         x = jax.random.normal(key, (batch_size, seq_len, d_model))
         y = jax.random.randint(key, (batch_size,), 0, 10)
-
-    with jax.default_device(mlx):
-        variables = jax.device_put(variables, mlx)
-        x = jax.device_put(x, mlx)
-        y = jax.device_put(y, mlx)
 
         @jax.jit
         def train_step(variables, x, y):

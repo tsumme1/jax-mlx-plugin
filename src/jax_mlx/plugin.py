@@ -23,6 +23,7 @@ def _get_library_path():
 
 def initialize():
     """Called by JAX to initialize this plugin."""
+    import os
     from jax._src import xla_bridge
     
     lib_path = _get_library_path()
@@ -42,8 +43,7 @@ def initialize():
         print("[MLX-Plugin] Library not found!")
         raise RuntimeError("MLX PJRT library not found")
     
-    # Register SDPA lowering separately, after plugin is registered
-    # This must succeed independently of linalg registration
+    # Register SDPA and LayerNorm lowerings and monkey-patches
     _register_sdpa_lowering()
 
 

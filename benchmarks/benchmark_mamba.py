@@ -22,10 +22,6 @@ Usage:
 import os
 if "MLX_PJRT_DEBUG" in os.environ:
     del os.environ["MLX_PJRT_DEBUG"]
-if "JAX_PLATFORMS" not in os.environ:
-    os.environ["JAX_PLATFORMS"] = "cpu,mlx"
-elif "cpu" not in os.environ["JAX_PLATFORMS"]:
-    os.environ["JAX_PLATFORMS"] = "cpu," + os.environ["JAX_PLATFORMS"]
 
 import jax
 import jax.numpy as jnp
@@ -180,12 +176,9 @@ def benchmark_mamba(variant: str, batch_size=32, seq_len=1024, d_model=256,
 
     parallel = (variant == "parallel")
 
-    try:
-        device = jax.devices("mlx")[0]
-        device_name = "mlx"
-    except Exception:
-        device = jax.devices("cpu")[0]
-        device_name = "cpu"
+    device = jax.devices()[0]
+    cpu = jax.devices("cpu")[0]
+    device_name = jax.default_backend()
 
     scan_type = "lax.associative_scan (parallel)" if parallel else "lax.scan (sequential, unrolled)"
 
@@ -196,7 +189,7 @@ def benchmark_mamba(variant: str, batch_size=32, seq_len=1024, d_model=256,
 
     lr = 0.001
 
-    with jax.default_device(device):
+    with jax.default_device(cpu):
         rngs = nnx.Rngs(0)
         model = MambaClassifier(d_model, d_state, num_classes,
                                 parallel=parallel, rngs=rngs)
@@ -207,32 +200,42 @@ def benchmark_mamba(variant: str, batch_size=32, seq_len=1024, d_model=256,
         x = jax.random.normal(k1, (batch_size, seq_len, d_model))
         y = jax.random.randint(k2, (batch_size,), 0, num_classes)
 
-        # Warmup (includes JIT compilation)
-        print(f"  Compiling + warming up ({num_warmup} steps)...")
-        t_compile = time.perf_counter()
-        for i in range(num_warmup):
-            loss = train_step(model, optimizer, x, y)
-            loss.block_until_ready()
-            if i == 0:
-                compile_time = time.perf_counter() - t_compile
-                print(f"  First step (compile): {compile_time:.1f}s")
-        print("  Warmup done ✓\n")
+    # Transfer to target device
+    model_state = nnx.state(model)
+    model_state = jax.device_put(model_state, device)
+    nnx.update(model, model_state)
+    opt_state = nnx.state(optimizer)
+    opt_state = jax.device_put(opt_state, device)
+    nnx.update(optimizer, opt_state)
+    x = jax.device_put(x, device)
+    y = jax.device_put(y, device)
 
-        # Timed runs
-        print(f"  {'─'*40}")
-        times = []
-        for i in range(num_runs):
-            t0 = time.perf_counter()
-            loss = train_step(model, optimizer, x, y)
-            loss.block_until_ready()
-            elapsed = (time.perf_counter() - t0) * 1000
-            times.append(elapsed)
-            print(f"    Run {i+1:2d}: {elapsed:7.2f}ms  (loss: {float(loss):.4f})")
+    # Warmup (includes JIT compilation)
+    print(f"  Compiling + warming up ({num_warmup} steps)...")
+    t_compile = time.perf_counter()
+    for i in range(num_warmup):
+        loss = train_step(model, optimizer, x, y)
+        loss.block_until_ready()
+        if i == 0:
+            compile_time = time.perf_counter() - t_compile
+            print(f"  First step (compile): {compile_time:.1f}s")
+    print("  Warmup done ✓\n")
 
-        mean_t = np.mean(times)
-        std_t = np.std(times)
-        min_t = np.min(times)
-        print(f"\n  Mean: {mean_t:.2f}ms ± {std_t:.2f}ms  Min: {min_t:.2f}ms")
+    # Timed runs
+    print(f"  {'─'*40}")
+    times = []
+    for i in range(num_runs):
+        t0 = time.perf_counter()
+        loss = train_step(model, optimizer, x, y)
+        loss.block_until_ready()
+        elapsed = (time.perf_counter() - t0) * 1000
+        times.append(elapsed)
+        print(f"    Run {i+1:2d}: {elapsed:7.2f}ms  (loss: {float(loss):.4f})")
+
+    mean_t = np.mean(times)
+    std_t = np.std(times)
+    min_t = np.min(times)
+    print(f"\n  Mean: {mean_t:.2f}ms ± {std_t:.2f}ms  Min: {min_t:.2f}ms")
 
     return mean_t, std_t, min_t
 

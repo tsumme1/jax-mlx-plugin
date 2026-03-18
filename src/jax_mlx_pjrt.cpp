@@ -281,12 +281,14 @@ inline bool compile_aggressive_enabled() {
     return cached == 1;
 }
 
-// Feature toggle: Mega-compile (ENABLED BY DEFAULT)
-// Defers eval() to sync points for lazy execution
-// Set MLX_NO_MEGA_COMPILE=1 to disable
+// Feature toggle: Mega-compile (DISABLED BY DEFAULT)
+// Defers eval() to sync points for lazy execution.
+// Benchmarks show synchronous eval (like jax-mps) gives better performance:
+// the deferred eval builds up too-large MLX graphs that hurt kernel scheduling.
+// Set MLX_MEGA_COMPILE=1 to enable deferred eval.
 inline bool mega_compile_enabled() {
     static int cached = -1;
-    if (cached == -1) cached = (getenv("MLX_NO_MEGA_COMPILE") != nullptr) ? 0 : 1;
+    if (cached == -1) cached = (getenv("MLX_MEGA_COMPILE") != nullptr) ? 1 : 0;
     return cached == 1;
 }
 
@@ -458,11 +460,18 @@ struct MLXExecutable {
     // Key = segment index (0 = pre-first-while, 1 = between whiles, etc.)
     std::map<size_t, std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>> cached_segment_fns;
     
+    // Cached compile-safe result (computed once, graph is immutable)
+    int compile_safe_cached = -1;  // -1 = not computed, 0 = not safe, 1 = safe
+    
+    // Set to true when mx::compile() call fails at runtime (e.g. while loop eval inside trace).
+    // Prevents infinite recompile cycle and routes directly to ExecuteGraphSegmented.
+    bool use_segmented = false;
+    bool whole_compile_failed = false;  // Set when whole-graph compile fails for while-containing graphs
 
     
     MLXExecutable(std::string n, int r, int p) 
         : name(n), num_replicas(r), num_partitions(p), num_args(1), num_outputs(1), 
-          ref_count(1), constants_cached(false), compiled_fn(std::nullopt) {}
+          ref_count(1), constants_cached(false), compiled_fn(std::nullopt), compile_safe_cached(-1) {}
 };
 
 struct MLXLoadedExecutable {
@@ -1183,9 +1192,7 @@ PJRT_Error* MLX_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* args) {
     
 
     
-    if (args->event) {
-        args->event = reinterpret_cast<PJRT_Event*>(new MLXEvent(true));
-    }
+    args->event = reinterpret_cast<PJRT_Event*>(new MLXEvent(true));
     
     return Ok();
 }
@@ -1754,6 +1761,8 @@ if (debug_mode()) std::cout << "[MLX-PJRT] func.call @" << callee << " blocks co
         
         // [BLOCKER 3] NaN constants: MLX Metal bug — 'nan' undeclared in ternary_ops.h
         // This affects lgamma, linalg ops with degenerate-case sentinel values, etc.
+        // The bug triggers whenever Metal codegen tries to embed NaN as a constant literal.
+        // Workaround via 0/0 division doesn't work inside mx::compile tracing.
         if (op.op_name == "stablehlo.constant" || op.op_name == "mhlo.constant") {
             if (op.float_array_attrs.count("value")) {
                 const auto& vals = op.float_array_attrs.at("value");
@@ -2980,9 +2989,11 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Cached segment " << seg_idx << " fa
                                 [sub_g, funcs_copy](const std::vector<mlx::core::array>& inputs) {
                                     return ExecuteGraph(sub_g, inputs, nullptr, &funcs_copy, nullptr);
                                 });
-                            g_in_compile_context = false;
-                            
+                            // NOTE: mx::compile only traces on the FIRST call to compiled_fn.
+                            // Keep g_in_compile_context=true through that first call so eval
+                            // guards in ExecuteGraph are active during tracing.
                             seg_outputs = compiled_fn(seg_inputs);
+                            g_in_compile_context = false;
                             exec->cached_segment_fns[seg_idx] = compiled_fn;
                             compiled = true;
 if (debug_mode()) std::cout << "[MLX-PJRT]   Compiled segment " << seg_idx << ": " << num_ops << " ops" << std::endl;
@@ -3186,6 +3197,14 @@ if (debug_mode()) {
             // =====================================================================
             // WHILE LOOP / SCAN HANDLER
             // =====================================================================
+            // While loops require eval() per iteration which is incompatible with
+            // mx::compile tracing. When inside a compile context, throw immediately
+            // so the outer mx::compile falls back to running the function directly.
+            // This matches jax-mps's CompileIncompatibleError pattern.
+            if (g_in_compile_context) {
+                throw std::runtime_error("stablehlo.while requires eval() — incompatible with compile tracing");
+            }
+            
             // regions: [0] cond, [1] body
             //
             // Strategy 1 - SCAN UNROLLING (preferred):
@@ -3387,6 +3406,16 @@ if (debug_mode()) std::cerr << "[MLX-COMPILE-FAIL] Scan body compilation failed:
                         }
                     }
                     
+                    // Scan batch size: eval every N iterations to bound Metal graph size.
+                    // Full unrolling (N=trip_count) builds massive graphs; per-iteration eval (N=1) is too slow.
+                    // Middle ground: eval periodically to keep Metal compilation manageable.
+                    static int scan_batch = -1;
+                    if (scan_batch == -1) {
+                        const char* env = std::getenv("MLX_SCAN_BATCH");
+                        scan_batch = env ? std::atoi(env) : 0;  // 0 = no batching (full unroll)
+                    }
+                    
+                    auto scan_start = timing_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
                     for (int i = 0; i < scan_trip_count; ++i) {
                         current_args[scan_counter_idx] = mlx::core::array(i, mlx::core::int32);
                         if (use_compiled_body) {
@@ -3399,6 +3428,14 @@ if (debug_mode()) std::cerr << "[MLX-COMPILE-FAIL] Scan body compilation failed:
                         } else {
                             current_args = ExecuteGraphSegmented(body_graph, current_args, functions, nullptr, &val_map);
                         }
+                        // Periodic eval to bound Metal graph size
+                        if (scan_batch > 0 && (i + 1) % scan_batch == 0 && i + 1 < scan_trip_count) {
+                            mlx::core::eval(current_args);
+                        }
+                    }
+                    if (timing_mode()) {
+                        auto scan_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - scan_start).count();
+                        std::cout << "[TIMING] Scan unroll: " << scan_trip_count << " iters, " << current_args.size() << " outputs, " << scan_us << "us (" << scan_us/1000.0 << "ms) compiled_body=" << use_compiled_body << " batch=" << scan_batch << std::endl;
                     }
                     
                     op_outputs = current_args;
@@ -3411,7 +3448,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Scan completed " << scan_trip_count
                     // so the compiled body doesn't need explicit eval.
                     // The interpreted fallback path uses eval(current_args) to prevent
                     // lazy graph accumulation.
-                    int iter_limit = 100000;
+                    int iter_limit = 100000; // dynamic while loop path
                     int iter = 0;
                     
                     // Compile body and condition sub-functions
@@ -3420,8 +3457,9 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Scan completed " << scan_trip_count
                     std::optional<std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>> compiled_body_fn;
                     std::optional<std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>> compiled_cond_fn;
                     
-                    // Collect outer scope values to pass as extra inputs
-                    // (MLX compile requires all arrays be function inputs, not closure captures)
+                    // Collect FILTERED outer scope values to pass as extra inputs.
+                    // Only include vals actually referenced by body/cond ops (not all val_map entries).
+                    // This reduces input count from ~80-181 to only the values the body actually needs.
                     std::vector<int> outer_val_ids;
                     std::vector<mlx::core::array> outer_val_arrays;
                     size_t body_input_count = body_graph.input_ids.size();
@@ -3430,19 +3468,63 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Scan completed " << scan_trip_count
                     if (compile_enabled() && !g_in_compile_context) {
                         auto funcs_copy = functions ? *functions : std::map<std::string, std::shared_ptr<MLXGraph>>{};
                         
-                        // Collect outer vals that body/cond might reference
-                        for (auto it = val_map.begin(); it != val_map.end(); ++it) {
-                            bool is_body_input = false;
-                            for (int bid : body_graph.input_ids) {
-                                if (bid == it->first) { is_body_input = true; break; }
+                        // Collect all IDs referenced by body/cond ops (recursively through subgraphs)
+                        std::set<int> body_input_set(body_graph.input_ids.begin(), body_graph.input_ids.end());
+                        std::set<int> cond_input_set(cond_graph.input_ids.begin(), cond_graph.input_ids.end());
+                        
+                        std::set<int> needed_ids;
+                        auto collect_ids = [&](const MLXGraph& g) {
+                            std::set<int> defined;
+                            for (const auto& n : g.nodes) {
+                                for (int in_id : n.inputs) {
+                                    if (!defined.count(in_id) && !body_input_set.count(in_id) && !cond_input_set.count(in_id)) {
+                                        needed_ids.insert(in_id);
+                                    }
+                                }
+                                for (int out_id : n.outputs) defined.insert(out_id);
+                                // Recursively check subgraphs (func.call bodies etc.)
+                                for (const auto& sg : n.subgraphs) {
+                                    if (sg) {
+                                        for (const auto& sn : sg->nodes) {
+                                            for (int sid : sn.inputs) needed_ids.insert(sid);
+                                        }
+                                    }
+                                }
                             }
-                            if (!is_body_input) {
-                                outer_val_ids.push_back(it->first);
-                                outer_val_arrays.push_back(it->second);
+                        };
+                        collect_ids(body_graph);
+                        collect_ids(cond_graph);
+                        // Also check func.call targets referenced from body/cond
+                        for (const auto& n : body_graph.nodes) {
+                            if (n.op_name == "func.call" && n.attributes.count("callee")) {
+                                std::string callee = n.attributes.at("callee");
+                                if (!callee.empty() && callee[0] == '@') callee = callee.substr(1);
+                                if (functions && functions->count(callee)) {
+                                    collect_ids(*functions->at(callee));
+                                }
+                            }
+                        }
+                        for (const auto& n : cond_graph.nodes) {
+                            if (n.op_name == "func.call" && n.attributes.count("callee")) {
+                                std::string callee = n.attributes.at("callee");
+                                if (!callee.empty() && callee[0] == '@') callee = callee.substr(1);
+                                if (functions && functions->count(callee)) {
+                                    collect_ids(*functions->at(callee));
+                                }
                             }
                         }
                         
-                        // Compile body (skip if nested control flow — mx::compile tracing can't handle while ops)
+                        // Only include outer vals that are actually needed AND exist in val_map
+                        for (int needed_id : needed_ids) {
+                            if (val_map.count(needed_id)) {
+                                outer_val_ids.push_back(needed_id);
+                                outer_val_arrays.push_back(val_map.at(needed_id));
+                            }
+                        }
+                        
+if (debug_mode()) std::cout << "[MLX-PJRT]   While loop: filtered outer vals: " << outer_val_ids.size() << " (from " << val_map.size() << " total)" << std::endl;
+                        
+                        // Compile body (skip if nested control flow)
                         if (!has_control_flow(body_graph, &funcs_copy)) {
                             try {
                                 auto body_g = body_graph;
@@ -3467,7 +3549,7 @@ if (debug_mode()) std::cerr << "[MLX-COMPILE-FAIL] While body compilation failed
                             }
                         }
                         
-                        // Compile condition (skip if nested control flow — mx::compile tracing can't handle while ops)
+                        // Compile condition (skip if nested control flow)
                         if (!has_control_flow(cond_graph, &funcs_copy)) {
                             try {
                                 auto cond_g = cond_graph;
@@ -3494,14 +3576,33 @@ if (debug_mode()) std::cerr << "[MLX-COMPILE-FAIL] While cond compilation failed
                     }
                     
 if (debug_mode()) std::cout << "[MLX-PJRT]   While loop starting with " << current_args.size() << " args, compiled_body=" << use_compiled_body << " compiled_cond=" << use_compiled_cond << std::endl;
+                    
+                    // Pre-build combined input vector (loop vars + outer vals) to avoid
+                    // rebuilding every iteration. We update the loop var portion in-place.
+                    size_t n_loop_vars = current_args.size();
+                    size_t n_outer = outer_val_arrays.size();
+                    std::vector<mlx::core::array> combined_inputs;
+                    if (use_compiled_body || use_compiled_cond) {
+                        combined_inputs.reserve(n_loop_vars + n_outer);
+                        combined_inputs = current_args;
+                        combined_inputs.insert(combined_inputs.end(), outer_val_arrays.begin(), outer_val_arrays.end());
+                    }
+                    
+                    // Timing instrumentation for while loop iterations
+                    long long total_cond_us = 0, total_eval_us = 0, total_body_us = 0;
+                    auto while_start_time = timing_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+                    
                     while (iter++ < iter_limit) {
                         // Evaluate condition
+                        auto t_cond_start = timing_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
                         std::vector<mlx::core::array> cond_res;
                         if (use_compiled_cond) {
                             try {
-                                std::vector<mlx::core::array> cond_inputs = current_args;
-                                cond_inputs.insert(cond_inputs.end(), outer_val_arrays.begin(), outer_val_arrays.end());
-                                cond_res = compiled_cond_fn.value()(cond_inputs);
+                                // Update loop var portion of pre-built combined_inputs
+                                for (size_t i = 0; i < n_loop_vars; ++i) {
+                                    combined_inputs[i] = current_args[i];
+                                }
+                                cond_res = compiled_cond_fn.value()(combined_inputs);
                             } catch (const std::exception& e) {
 if (debug_mode()) std::cout << "[MLX-PJRT]   While compiled cond failed: " << e.what() << std::endl;
                                 use_compiled_cond = false;
@@ -3510,32 +3611,36 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   While compiled cond failed: " << e.
                         } else {
                             cond_res = ExecuteGraphSegmented(cond_graph, current_args, functions, nullptr, &val_map);
                         }
+                        if (timing_mode()) total_cond_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t_cond_start).count();
                         
                         if (cond_res.empty()) break;
                         
-                        // Must eval() to get concrete boolean for branch decision
+                        // Combined eval: condition + loop vars in one call.
+                        auto t_eval_start = timing_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
                         bool keep_going = false;
                         try {
-                            mlx::core::array c = cond_res[0];
-                            c.eval();
-                            if (c.dtype() != mlx::core::bool_) c = mlx::core::astype(c, mlx::core::bool_);
-                            c.eval();
-                            keep_going = c.item<bool>();
+                            current_args.push_back(cond_res[0]);
+                            mlx::core::eval(current_args);
+                            auto cond_val = std::move(current_args.back());
+                            current_args.pop_back();
+                            keep_going = cond_val.item<bool>();
                         } catch(const std::exception& e) {
 if (debug_mode()) std::cout << "[MLX-PJRT]   While cond exception: " << e.what() << std::endl;
                             break;
                         }
+                        if (timing_mode()) total_eval_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t_eval_start).count();
                         
                         if (!keep_going) break;
                         
                         // Execute body
+                        auto t_body_start = timing_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
                         if (use_compiled_body) {
                             try {
-                                std::vector<mlx::core::array> all_inputs = current_args;
-                                all_inputs.insert(all_inputs.end(), outer_val_arrays.begin(), outer_val_arrays.end());
-                                current_args = compiled_body_fn.value()(all_inputs);
-                                // No eval needed: compiled body dispatches to Metal directly,
-                                // and condition's eval() next iteration provides sync point
+                                // Update loop var portion of pre-built combined_inputs
+                                for (size_t i = 0; i < n_loop_vars; ++i) {
+                                    combined_inputs[i] = current_args[i];
+                                }
+                                current_args = compiled_body_fn.value()(combined_inputs);
                             } catch (const std::exception& e) {
 if (debug_mode()) std::cout << "[MLX-PJRT]   While compiled body failed: " << e.what() << std::endl;
                                 if (strict_compile_mode()) {
@@ -3550,11 +3655,17 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   While compiled body failed: " << e.
                             }
                         } else {
                             current_args = ExecuteGraphSegmented(body_graph, current_args, functions, nullptr, &val_map);
-                            // Force materialization to prevent lazy graph accumulation
-                            // in the interpreted path
                             mlx::core::eval(current_args);
                         }
+                        if (timing_mode()) total_body_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t_body_start).count();
 
+                    }
+                    if (timing_mode()) {
+                        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - while_start_time).count();
+                        std::cout << "[TIMING] While loop: " << (iter-1) << " iters, total=" << total_us << "us (" << total_us/1000.0 << "ms)"
+                                  << " cond=" << total_cond_us << "us eval=" << total_eval_us << "us body=" << total_body_us << "us"
+                                  << " [compiled_body=" << use_compiled_body << " compiled_cond=" << use_compiled_cond 
+                                  << " n_args=" << n_loop_vars << " n_outer=" << n_outer << "]" << std::endl;
                     }
                     op_outputs = current_args;
                 }
@@ -3775,15 +3886,31 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      int H_out = (H - win_h) / str_h + 1;
                      int W_out = (W - win_w) / str_w + 1;
                      
-                     // Fast path: non-overlapping max/min pool with NHWC layout
+                     // Fast path: non-overlapping max/min pool
                      if (is_extremal_pool && n_dim == 0 && str_h == win_h && str_w == win_w 
                          && H == H_out * win_h && W == W_out * win_w) {
-                         auto reshaped = mlx::core::reshape(input, {N, H_out, win_h, W_out, win_w, C});
+                         // Transpose to NHWC for reshape logic if needed
+                         auto pool_input = input;
+                         bool need_layout_transpose = (c_dim != static_cast<int>(input.ndim()) - 1);
+                         if (need_layout_transpose) {
+                             std::vector<int> to_nhwc = {n_dim, h_dim, w_dim, c_dim};
+                             pool_input = mlx::core::transpose(input, to_nhwc);
+                         }
+                         auto reshaped = mlx::core::reshape(pool_input, {N, H_out, win_h, W_out, win_w, C});
                          auto windows = mlx::core::transpose(reshaped, {0, 1, 3, 2, 4, 5});
                          if (is_max_pool) {
                              rw_result = mlx::core::max(windows, {3, 4});
                          } else {
                              rw_result = mlx::core::min(windows, {3, 4});
+                         }
+                         // Transpose result back to original layout
+                         if (need_layout_transpose) {
+                             std::vector<int> from_nhwc(4);
+                             from_nhwc[n_dim] = 0;
+                             from_nhwc[h_dim] = 1;
+                             from_nhwc[w_dim] = 2;
+                             from_nhwc[c_dim] = 3;
+                             rw_result = mlx::core::transpose(rw_result, from_nhwc);
                          }
                          rw_handled = true;
                      } else {
@@ -4043,6 +4170,16 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                     
                     // Fast path: non-overlapping pool with NHWC, use mx::vjp
                     if (n_dim == 0 && str_h == win_h && str_w == win_w && H == H_out * win_h && W == W_out * win_w) {
+                        // Transpose operand and source to NHWC layout for the VJP reshape logic
+                        auto op_nhwc = operand;
+                        auto src_nhwc = source;
+                        bool need_layout_transpose = (c_dim != static_cast<int>(operand.ndim()) - 1);
+                        if (need_layout_transpose) {
+                            // Build permutation: [n_dim, h_dim, w_dim, c_dim]
+                            std::vector<int> to_nhwc = {n_dim, h_dim, w_dim, c_dim};
+                            op_nhwc = mlx::core::transpose(operand, to_nhwc);
+                            src_nhwc = mlx::core::transpose(source, to_nhwc);
+                        }
                         int vjp_N = N, vjp_H_out = H_out, vjp_W_out = W_out;
                         int vjp_win_h = win_h, vjp_win_w = win_w, vjp_C = C;
                         bool vjp_is_max = is_max_select;
@@ -4052,8 +4189,18 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                             auto w = mlx::core::transpose(r, {0, 1, 3, 2, 4, 5});
                             return {vjp_is_max ? mlx::core::max(w, {3, 4}) : mlx::core::min(w, {3, 4})};
                         };
-                        auto [fwd_out, vjps] = mlx::core::vjp(vjp_fn, {operand}, {source});
+                        auto [fwd_out, vjps] = mlx::core::vjp(vjp_fn, {op_nhwc}, {src_nhwc});
                         sas_result = vjps[0];
+                        // Transpose result back to original layout
+                        if (need_layout_transpose) {
+                            // Inverse of [n_dim, h_dim, w_dim, c_dim] 
+                            std::vector<int> from_nhwc(4);
+                            from_nhwc[n_dim] = 0;
+                            from_nhwc[h_dim] = 1;
+                            from_nhwc[w_dim] = 2;
+                            from_nhwc[c_dim] = 3;
+                            sas_result = mlx::core::transpose(sas_result, from_nhwc);
+                        }
                         sas_handled = true;
                     } else {
                         // General path: mask-based gradient for any layout/overlap
@@ -4429,16 +4576,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
             
             } else if (op.op_name == "stablehlo.dot_general" || op.op_name == "mhlo.dot_general") {
                 if (op_inputs.size() >= 2) {
-                // Simplified dot_general: assume simple matmul for now or try to handle transpose
-                // MLX matmul contract last dim of A and first dim of B (standard)?? No, standard is last of A and last-1 of B for >2D?
-                // MLX Documention: matmul(a, b) -> standard matrix multiplication.
-                
-                // Inspect contracting dims
-                // Default matmul in JAX (x @ y) for 2D is: lhs contract [1], rhs contract [0].
-                
-                // NOTE: Proper general dot requires transposing axes to align contracting dims.
-                // For MVP, we pass directly to mlx::core::matmul which handles standard broadcasting.
-                // If contracting dims are non-standard, we would need to transpose.
+                // dot_general: transpose+reshape+matmul+reshape decomposition
                 
                 if (op.int_array_attrs.count("lhs_contracting") && op.int_array_attrs.count("rhs_contracting")) {
                      std::vector<int> lhs_c, rhs_c;
@@ -4451,7 +4589,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      auto lhs = op_inputs[0];
                      auto rhs = op_inputs[1];
                      
-                     // 1. Identify Remaining Dims
+                     // Identify remaining dims
                      std::vector<int> lhs_remain, rhs_remain;
                      auto get_remain = [](const mlx::core::array& a, const std::vector<int>& batch, const std::vector<int>& contract) {
                         std::vector<int> remain;
@@ -4466,7 +4604,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      lhs_remain = get_remain(lhs, lhs_b, lhs_c);
                      rhs_remain = get_remain(rhs, rhs_b, rhs_c);
                      
-                     // 2. Permute: [Batch, Remain, Contract]
+                     // Permute: LHS=[Batch, Remain, Contract], RHS=[Batch, Contract, Remain]
                      std::vector<int> lhs_perm;
                      lhs_perm.insert(lhs_perm.end(), lhs_b.begin(), lhs_b.end());
                      lhs_perm.insert(lhs_perm.end(), lhs_remain.begin(), lhs_remain.end());
@@ -4474,76 +4612,25 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      
                      std::vector<int> rhs_perm;
                      rhs_perm.insert(rhs_perm.end(), rhs_b.begin(), rhs_b.end());
-                     rhs_perm.insert(rhs_perm.end(), rhs_c.begin(), rhs_c.end()); // Contract first for RHS? No, for matmul(A, B) -> A(..., K), B(K, ...) ? 
-                     // MLX Matmul: A(..., M, K), B(..., K, N) -> (..., M, N)
-                     // So we want RHS to be [Batch, Contract, Remain] -> (..., K, N)
+                     rhs_perm.insert(rhs_perm.end(), rhs_c.begin(), rhs_c.end());
                      rhs_perm.insert(rhs_perm.end(), rhs_remain.begin(), rhs_remain.end());
                      
-                     // Only transpose if array is actually multi-dimensional.
-                     // Scalar (0-dim) arrays cannot be transposed.
                      if (lhs.ndim() > 0 && !lhs_perm.empty()) lhs = mlx::core::transpose(lhs, lhs_perm);
                      if (rhs.ndim() > 0 && !rhs_perm.empty()) rhs = mlx::core::transpose(rhs, rhs_perm);
                      
-                     // 3. Reshape for Matmul (flatten batch/remain/contract groups)
-                     // Target LHS: [BatchProd, RemainProd, ContractProd]
-                     // Target RHS: [BatchProd, ContractProd, RemainProd]
-                     // Actually, we can keep Batch distinct if we want, but flattening is safer for "BatchProd"
-                     
-                     // Need actual shapes
-                     // Just perform matmul on the permuted? 
-                     // If batch is multiple dims, matmul handles it? 
-                     // MLX broadcast rules: Two arrays have compatible shapes if, for every dimension, the dimension lengths are equal or one of them is 1.
-                     // But we want "Batch" dims to be treated as batch, not broadcast if different (they should match).
-                     // The issue is if lhs_remain or rhs_remain are multiple dims. Matmul takes last 2 dims.
-                     // So we MUST flatten "Remain" into 1 dim (M or N) and "Contract" into 1 dim (K).
-                     // And flatten "Batch" into 1 dim (B) ? 
-                     // Or [B1, B2..., M, K]
-                     
-                     // Safest: Flatten all Batch into 1 dim, all Remain into 1 dim, all Contract into 1 dim.
-                     // LHS -> [B*..., M*..., K*...] -> 3D
-                     // RHS -> [B*..., K*..., N*...] -> 3D
-                     
-                     // Helper to calc size
-                     auto prod_dims = [&](const mlx::core::array& arr, const std::vector<int>& dims) {
-                         int p = 1; for(int d : dims) p *= arr.shape(d); return p; // NOTE: arr is already permuted? No, use original
-                         // Actually hard to track sizes from original indices.
-                         // Easier to inspect current shape after transpose.
-                     };
-                     
-                     // After transpose:
-                     // LHS is [Batch..., Remain..., Contract...]
+                     // Flatten to [Batch..., M, K] and [Batch..., K, N]
                      int b_rank = lhs_b.size();
                      int lr_rank = lhs_remain.size();
-                     int lc_rank = lhs_c.size();
                      int rc_rank = rhs_c.size();
-                     int rr_rank = rhs_remain.size();
-                     
-                     // Flatten Batch
-                     // But wait, reshape requires knowing split points.
-                     // Since we just transposed, they are contiguous.
-                     
-
                      
                      auto lhs_s = lhs.shape();
                      std::vector<int> lhs_shape(lhs_s.begin(), lhs_s.end());
-                     // Splits: [0...b_rank), [b_rank...b_rank+lr_rank), [end-lc_rank...end)
-                     
-                     // To do this cleanly: 
-                     // Flatten to 3D: [BatchProd, M, K]
-                     // But wait, we might not have Batch.
-                     // Handle B=1 case.
-                     
-                     // Let's rely on MLX to handle >2D if we merge Remain and Contract.
-                     // LHS -> [Batch..., M_flat, K_flat]
-                     // RHS -> [Batch..., K_flat, N_flat]
-                     
-                     // We need to construct new shape for LHS
                      int m_size = 1; for(int i=b_rank; i<b_rank+lr_rank; ++i) m_size *= lhs_shape[i];
-                     int k_size = 1; for(int i=b_rank+lr_rank; i<lhs_shape.size(); ++i) k_size *= lhs_shape[i];
+                     int k_size = 1; for(size_t i=b_rank+lr_rank; i<lhs_shape.size(); ++i) k_size *= lhs_shape[i];
                      
                      auto rhs_s = rhs.shape();
                      std::vector<int> rhs_shape(rhs_s.begin(), rhs_s.end());
-                     int n_size = 1; for(int i=b_rank+rc_rank; i<rhs_shape.size(); ++i) n_size *= rhs_shape[i];
+                     int n_size = 1; for(size_t i=b_rank+rc_rank; i<rhs_shape.size(); ++i) n_size *= rhs_shape[i];
                      
                      std::vector<int> lhs_3d_shape;
                      for(int i=0; i<b_rank; ++i) lhs_3d_shape.push_back(lhs_shape[i]);
@@ -4552,7 +4639,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      
                      std::vector<int> rhs_3d_shape;
                      for(int i=0; i<b_rank; ++i) rhs_3d_shape.push_back(rhs_shape[i]);
-                     rhs_3d_shape.push_back(k_size); // Should match
+                     rhs_3d_shape.push_back(k_size);
                      rhs_3d_shape.push_back(n_size);
                      
                      lhs = mlx::core::reshape(lhs, mlx::core::Shape(lhs_3d_shape.begin(), lhs_3d_shape.end()));
@@ -4560,28 +4647,20 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Case executed " << all_branch_resul
                      
                      result = mlx::core::matmul(lhs, rhs);
                      
-                     // Result is [Batch..., M, N]
                      // Reshape back to [Batch..., Remain_LHS..., Remain_RHS...]
                      std::vector<int> final_shape;
                      for(int i=0; i<b_rank; ++i) final_shape.push_back(lhs_shape[i]);
-                     // Get original remaining dims sizes
-                     // Warning: identifying them from original input needs care.
-                     // But we know 'lhs_remain' indices referred to original. 
-                     // We need their values.
                      auto get_sizes = [&](const mlx::core::array& a, const std::vector<int>& idxs) {
                         std::vector<int> s; for(int id : idxs) s.push_back(a.shape(id)); return s;
                      };
-                     // Use op_inputs[0] (original)
                      auto lr_sizes = get_sizes(op_inputs[0], lhs_remain);
                      auto rr_sizes = get_sizes(op_inputs[1], rhs_remain);
-                     
                      final_shape.insert(final_shape.end(), lr_sizes.begin(), lr_sizes.end());
                      final_shape.insert(final_shape.end(), rr_sizes.begin(), rr_sizes.end());
-
                      result = mlx::core::reshape(result, mlx::core::Shape(final_shape.begin(), final_shape.end()));
                      
                 } else {
-                     // Fallback/Legacy
+                     // Fallback: simple matmul
                      result = mlx::core::matmul(op_inputs[0], op_inputs[1]);
                 }
             }
@@ -7579,26 +7658,26 @@ if (debug_mode()) {
                     int kW = kernel.shape(2);
                     int out_H = H_in + pad_lo[0] + pad_hi[0] - (kH - 1) * rhs_dilation[0];
                     int out_W = W_in + pad_lo[1] + pad_hi[1] - (kW - 1) * rhs_dilation[1];
-                    // Weight gradient pattern: kernel spatial is very large relative to output
-                    if (out_H > 0 && out_W > 0 && kH >= 4 * out_H && kW >= 4 * out_W &&
+                    // Weight gradient pattern: kernel spatial is large relative to output
+                    // Relaxed from 4x to 2x to catch stride-2 cases (e.g., kH=8, out_H=3)
+                    if (out_H > 0 && out_W > 0 && kH >= 2 * out_H && kW >= 2 * out_W &&
                         strides[0] == 1 && strides[1] == 1 &&
-                        lhs_dilation[0] == 1 && lhs_dilation[1] == 1 &&
-                        rhs_dilation[0] == 1 && rhs_dilation[1] == 1) {
+                        lhs_dilation[0] == 1 && lhs_dilation[1] == 1) {
                          use_weight_grad_opt = true;
 if (debug_mode()) std::cout << "[MLX-PJRT] WEIGHT GRAD OPT: detected huge kernel " << kH << "x" << kW 
-                            << " -> " << out_H << "x" << out_W << " output, using mx::vjp" << std::endl;
+                            << " -> " << out_H << "x" << out_W << " output"
+                            << " rhs_dil=" << rhs_dilation[0] << "," << rhs_dilation[1]
+                            << ", using mx::vjp" << std::endl;
                         
                         // mx::vjp weight gradient computation:
-                        // Instead of manual sliced matmuls, we reconstruct the original forward
-                        // conv2d call and use MLX's native VJP to compute the weight gradient.
+                        // Instead of conv_general with huge dilated kernels, reconstruct the
+                        // original forward conv and use MLX's native VJP for the weight gradient.
                         // This uses MLX's optimized Metal backward kernel which is 3-5x faster.
                         //
-                        // XLA weight gradient pattern (before permutation):
-                        // op_inputs[0] = activations with dim [f, 0, 1, b]
-                        //   XLA "f" = TRUE BATCH (e.g. 256), "b" = TRUE Ci (e.g. 3)
-                        // op_inputs[1] = grad_output with dim [i, 0, 1, o]
-                        //   XLA "i" = TRUE BATCH (e.g. 256), "o" = TRUE Co (e.g. 64)
-                        // output dim = [0, 1, b, f] => [kH, kW, Ci, Co]
+                        // Key relationships for weight grad conv -> original forward conv:
+                        // - rhs_dilation = original forward stride
+                        // - pad_lo/pad_hi = original forward padding (XLA lowering preserves these)
+                        // - output spatial = original kernel spatial dims
                         
                         auto orig_act = op_inputs[0];
                         auto orig_grad = op_inputs[1];
@@ -7621,33 +7700,28 @@ if (debug_mode()) std::cout << "[MLX-PJRT] WEIGHT GRAD OPT: detected huge kernel
                         grad_perm.push_back(static_cast<int>(kern_out));
                         
                         auto act_std = mlx::core::transpose(orig_act, act_perm);   // [B, H, W, Ci]
-                        auto grad_std = mlx::core::transpose(orig_grad, grad_perm); // [B, H, W, Co]
+                        auto grad_std = mlx::core::transpose(orig_grad, grad_perm); // [B, H_out, W_out, Co]
                         
-                        // Reconstruct forward conv parameters from the weight gradient pattern:
-                        // The output of XLA's weight grad conv has shape [kH_out, kW_out, Ci, Co]
-                        // where kH_out, kW_out are the original kernel spatial dims (e.g. 3x3)
-                        // Original forward: conv2d(act[B,H,W,Ci], w[Co,kH,kW,Ci]) -> out[B,H,W,Co]
-                        // with stride=1, padding that gives same spatial output
+                        // Reconstruct forward conv parameters:
                         int orig_kH = out_H;  // output of weight grad conv = original kernel size
                         int orig_kW = out_W;
                         
-                        // Original padding: for the forward conv that produced grad_std spatial dims
-                        // grad_std spatial = H_orig (same as act since stride=1)
-                        // With padding p: H_out = H_in + 2*p - kH + 1 = H_orig
-                        // => p = (kH - 1) / 2  (for symmetric padding)
-                        int orig_pad_h = pad_lo[0];  // XLA's pad_lo = original padding
-                        int orig_pad_w = pad_lo[1];
+                        // Original forward stride = rhs_dilation from weight grad conv
+                        std::vector<int> fwd_stride = {rhs_dilation[0], rhs_dilation[1]};
+                        
+                        // Original forward padding = weight grad conv padding
+                        // (XLA's weight gradient lowering preserves the forward padding)
+                        std::vector<int> fwd_pad_lo = {pad_lo[0], pad_lo[1]};
+                        std::vector<int> fwd_pad_hi = {pad_hi[0], pad_hi[1]};
                         
                         // Create a dummy weight with the original shape [Co, kH, kW, Ci]
                         auto dummy_w = mlx::core::zeros({Co_true, orig_kH, orig_kW, Ci_true}, act_std.dtype());
                         
                         // Use vjp to compute weight gradient via MLX's optimized backward kernel
-                        // Forward: conv2d(act, w, stride=1, padding=p) -> output
+                        // Forward: conv_general(act, w, stride, pad_lo, pad_hi) -> output
                         // VJP with cotangent=grad_std gives dW
-                        std::pair<int,int> fwd_stride = {1, 1};
-                        std::pair<int,int> fwd_pad = {orig_pad_h, orig_pad_w};
-                        auto vjp_fn = [&act_std, fwd_stride, fwd_pad](const std::vector<mlx::core::array>& primals) -> std::vector<mlx::core::array> {
-                            return {mlx::core::conv2d(act_std, primals[0], fwd_stride, fwd_pad)};
+                        auto vjp_fn = [&act_std, fwd_stride, fwd_pad_lo, fwd_pad_hi](const std::vector<mlx::core::array>& primals) -> std::vector<mlx::core::array> {
+                            return {mlx::core::conv_general(act_std, primals[0], fwd_stride, fwd_pad_lo, fwd_pad_hi, std::vector<int>{}, std::vector<int>{}, 1, false)};
                         };
                         
                         auto [fwd_outputs, vjps] = mlx::core::vjp(vjp_fn, {dummy_w}, {grad_std});
@@ -7851,6 +7925,15 @@ if (debug_mode()) std::cout << "[MLX-PJRT] WEIGHT GRAD OPT: detected huge kernel
                     // Fast path: non-overlapping pool with NHWC, use mx::vjp
                     // Consistent with forward reduce_window fast path (reshape + max/min)
                     if (n_dim == 0 && str_h == win_h && str_w == win_w && H == H_out * win_h && W == W_out * win_w) {
+                        // Transpose operand and source to NHWC layout for the VJP reshape logic
+                        auto op_nhwc = operand;
+                        auto src_nhwc = source;
+                        bool need_layout_transpose = (c_dim != static_cast<int>(operand.ndim()) - 1);
+                        if (need_layout_transpose) {
+                            std::vector<int> to_nhwc = {n_dim, h_dim, w_dim, c_dim};
+                            op_nhwc = mlx::core::transpose(operand, to_nhwc);
+                            src_nhwc = mlx::core::transpose(source, to_nhwc);
+                        }
                         int vjp_N = N, vjp_H_out = H_out, vjp_W_out = W_out;
                         int vjp_win_h = win_h, vjp_win_w = win_w, vjp_C = C;
                         bool vjp_is_max = is_max_select;
@@ -7860,8 +7943,16 @@ if (debug_mode()) std::cout << "[MLX-PJRT] WEIGHT GRAD OPT: detected huge kernel
                             auto w = mlx::core::transpose(r, {0, 1, 3, 2, 4, 5});
                             return {vjp_is_max ? mlx::core::max(w, {3, 4}) : mlx::core::min(w, {3, 4})};
                         };
-                        auto [fwd_out, vjps] = mlx::core::vjp(vjp_fn, {operand}, {source});
+                        auto [fwd_out, vjps] = mlx::core::vjp(vjp_fn, {op_nhwc}, {src_nhwc});
                         result = vjps[0];
+                        if (need_layout_transpose) {
+                            std::vector<int> from_nhwc(4);
+                            from_nhwc[n_dim] = 0;
+                            from_nhwc[h_dim] = 1;
+                            from_nhwc[w_dim] = 2;
+                            from_nhwc[c_dim] = 3;
+                            result = mlx::core::transpose(result, from_nhwc);
+                        }
                     } else {
                         // General path: mask-based gradient for any layout/overlap
                         // Recompute forward pool output to create selection mask
@@ -8843,6 +8934,9 @@ if (debug_mode()) std::cout << "[MLX-PJRT] MLX_LoadedExecutable_Execute called" 
     // This saves ~50-100µs per call
     const bool is_fast_path = !debug_mode() && exec->compiled_fn.has_value();
     
+    // Profile timing
+    auto t_phase = profile_mode() ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+    
 if (debug_mode()) {
     std::cout << "[MLX-PJRT] LoadedExecutable_Execute ENTRY" << std::endl << std::flush;
     std::cout << "[MLX-PJRT]   args ptr: " << (void*)args->execute_device << std::endl << std::flush;
@@ -8905,8 +8999,20 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   Input " << i << " (ID " << exec->gr
     auto t_exec_start = std::chrono::high_resolution_clock::now();
     std::vector<mlx::core::array> output_arrays;
     
-    // Check if we can compile this graph
-    bool should_compile = compile_enabled() && is_compile_safe(exec->graph, &exec->functions);
+    // Check if we can compile this graph (cached — graph is immutable)
+    if (exec->compile_safe_cached == -1) {
+        exec->compile_safe_cached = (compile_enabled() && is_compile_safe(exec->graph, &exec->functions)) ? 1 : 0;
+    }
+    bool should_compile = (exec->compile_safe_cached == 1);
+    
+    if (profile_mode()) {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto input_us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase).count();
+        if (input_us > 50) {  // Only log if > 50µs to avoid noise
+            std::cout << "[PROFILE] Execute setup+inputs: " << input_us << "µs (" << exec->graph.nodes.size() << " nodes, " << args->num_args << " args)" << std::endl;
+        }
+        t_phase = t_now;
+    }
     
     if (debug_mode()) {
         std::cout << "[MLX-PJRT] Graph has " << exec->graph.nodes.size() << " nodes, compile_safe=" << (should_compile ? "true" : "false") << ", ops: ";
@@ -8947,8 +9053,9 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   FAST PATH compiled_fn failed: " << 
             exec->compiled_fn = std::nullopt;
             output_arrays = ExecuteGraph(exec->graph, input_arrays, nullptr, &exec->functions, exec);
         }
-    } else if (should_compile && exec->graph.nodes.size() > 0) {
+    } else if (should_compile && exec->graph.nodes.size() > 0 && !exec->use_segmented) {
         // Create or use cached compiled function (skip 0-node graphs - nothing to fuse)
+        // Skip if previous call failed — graph has control flow incompatible with mx::compile tracing
         if (!exec->compiled_fn.has_value()) {
             auto graph_copy = exec->graph;
             auto functions_copy = exec->functions;
@@ -9017,19 +9124,91 @@ if (debug_mode()) std::cout << "[MLX-PJRT]   compiled_fn call failed: " << e.wha
                 mlx::core::disable_compile();
                 mlx::core::enable_compile();
                 exec->compiled_fn = std::nullopt;
-                output_arrays = ExecuteGraph(exec->graph, input_arrays, nullptr, &exec->functions, exec);
+                exec->use_segmented = true;  // Prevent recompile cycle
+                // Use segmented execution (compiles non-while segments) instead of plain interpreter
+                output_arrays = ExecuteGraphSegmented(exec->graph, input_arrays, &exec->functions, exec);
             }
         } else {
             if (strict_compile_mode()) {
-                fprintf(stderr, "[MLX-STRICT] FATAL: compile_safe=false, falling back to interpreter for graph '%s' (nodes=%zu)\n", exec->name.c_str(), exec->graph.nodes.size());
+                fprintf(stderr, "[MLX-STRICT] FATAL: compile_safe=false, falling back to segmented for graph '%s' (nodes=%zu)\n", exec->name.c_str(), exec->graph.nodes.size());
                 for (const auto& n : exec->graph.nodes) fprintf(stderr, "  op: %s\n", n.op_name.c_str());
                 fflush(stderr);
                 std::abort();
             }
-            output_arrays = ExecuteGraph(exec->graph, input_arrays, nullptr, &exec->functions, exec);
+            // Compilation failed (e.g. while ops) — use segmented execution instead of 
+            // plain interpreter. This compiles non-while segments with mx::compile() while
+            // handling while loops with compiled body/condition functions.
+if (timing_mode()) std::cout << "[TIMING] Graph not compiled (" << exec->graph.nodes.size() << " nodes) — using segmented execution" << std::endl;
+            output_arrays = ExecuteGraphSegmented(exec->graph, input_arrays, &exec->functions, exec);
         }
 
     } else if (compile_enabled() && has_while_ops(exec->graph) && exec->graph.nodes.size() > 1) {
+        // Try whole-graph mx::compile first (like jax-mps approach).
+        // mx::compile wraps the entire ExecuteGraph; if while handler's eval() triggers
+        // a compile-context error, mx::compile falls back to running the function directly
+        // but may still optimize non-while portions. 2-3× speedup observed in jax-mps.
+        if (!exec->use_segmented && !exec->compiled_fn.has_value() && !exec->whole_compile_failed) {
+            auto graph_copy = exec->graph;
+            auto functions_copy = exec->functions;
+            
+            // Pre-build constants (same as non-while compile path)
+            auto prebuilt_constants = std::make_shared<std::map<int, mlx::core::array>>();
+            for (const auto& node : graph_copy.nodes) {
+                if ((node.op_name == "stablehlo.constant" || node.op_name == "mhlo.constant") && 
+                    !node.outputs.empty()) {
+                    std::vector<mlx::core::array> dummy_inputs;
+                    auto const_graph = MLXGraph();
+                    const_graph.nodes.push_back(node);
+                    const_graph.output_ids = node.outputs;
+                    auto const_result = ExecuteGraph(const_graph, dummy_inputs, nullptr, nullptr, nullptr);
+                    if (!const_result.empty()) {
+                        mlx::core::eval(const_result[0]);
+                        prebuilt_constants->insert(std::make_pair(node.outputs[0], const_result[0]));
+                    }
+                }
+            }
+            
+            auto fn = [graph_copy, functions_copy, prebuilt_constants](const std::vector<mlx::core::array>& inputs) {
+                return ExecuteGraph(graph_copy, inputs, prebuilt_constants.get(), &functions_copy, nullptr);
+            };
+            
+            try {
+if (debug_mode()) std::cout << "[MLX-PJRT]   Attempting whole-graph compile for while-containing graph (" << graph_copy.nodes.size() << " nodes)" << std::endl;
+                g_in_compile_context = true;
+                exec->compiled_fn = mlx::core::compile(fn);
+                // First call triggers trace — keep compile context active
+                output_arrays = exec->compiled_fn.value()(input_arrays);
+                g_in_compile_context = false;
+                // If we got here, compile succeeded!
+                mlx::core::eval(output_arrays);
+if (debug_mode()) std::cout << "[MLX-PJRT]   Whole-graph compile SUCCEEDED for while-containing graph!" << std::endl;
+            } catch (const std::exception& e) {
+                g_in_compile_context = false;
+                mlx::core::disable_compile();
+                mlx::core::enable_compile();
+                exec->compiled_fn = std::nullopt;
+                exec->whole_compile_failed = true;
+                output_arrays.clear();
+if (debug_mode()) std::cout << "[MLX-PJRT]   Whole-graph compile failed: " << e.what() << ", falling back to segmented" << std::endl;
+            }
+        }
+        
+        // Use cached compiled function if whole-graph compile succeeded
+        if (exec->compiled_fn.has_value() && output_arrays.empty()) {
+            try {
+                output_arrays = exec->compiled_fn.value()(input_arrays);
+            } catch (const std::exception& e) {
+if (debug_mode()) std::cout << "[MLX-PJRT]   Cached whole-graph compile failed: " << e.what() << std::endl;
+                mlx::core::disable_compile();
+                mlx::core::enable_compile();
+                exec->compiled_fn = std::nullopt;
+                exec->whole_compile_failed = true;
+                output_arrays.clear();
+            }
+        }
+        
+        // Fall through to segmented/pattern execution if compile didn't work
+        if (output_arrays.empty()) {
         // Check for linalg patterns before segmented execution
         bool has_getrf = false;
         for (const auto& node : exec->graph.nodes) {
@@ -9144,6 +9323,7 @@ if (debug_mode()) std::cout << "[MLX-PJRT] slogdet pattern failed: " << e.what()
             // Graph has while loops blocking full compilation — use segment compilation
             output_arrays = ExecuteGraphSegmented(exec->graph, input_arrays, &exec->functions, exec);
         }
+        }  // close if (output_arrays.empty())
     } else if (exec->graph.nodes.size() > 0) {
         // No interpreter fallback: route everything through segmented compilation
         // This ensures all graphs get mx::compile() for their non-control-flow segments

@@ -10,9 +10,7 @@ import os
 if "MLX_PJRT_DEBUG" in os.environ:
     del os.environ["MLX_PJRT_DEBUG"]
 if "JAX_PLATFORMS" not in os.environ:
-    os.environ["JAX_PLATFORMS"] = "cpu,mlx"
-elif "cpu" not in os.environ["JAX_PLATFORMS"]:
-    os.environ["JAX_PLATFORMS"] = "cpu," + os.environ["JAX_PLATFORMS"]
+    os.environ["JAX_PLATFORMS"] = "mlx"
 
 import jax
 import jax.numpy as jnp
@@ -59,29 +57,19 @@ def create_train_step(model, lr=0.01):
 def benchmark_mlx(batch_size=2048, input_dim=2048, num_warmup=30, num_runs=20):
     """Benchmark MLP training on MLX."""
     try:
-        mlx = jax.devices("mlx")[0]
+        device = jax.devices("mlx")[0]
     except Exception as e:
         print(f"MLX device not available: {e}")
         return None, None
 
     model = MLP()
 
-    try:
-        cpu = jax.devices("cpu")[0]
-    except Exception:
-        cpu = mlx
-
-    with jax.default_device(cpu):
+    with jax.default_device(device):
         rng = jax.random.PRNGKey(0)
         params = model.init(rng, jnp.ones((batch_size, input_dim)))
         key = jax.random.PRNGKey(42)
         x = jax.random.normal(key, (batch_size, input_dim))
         y = jax.random.randint(key, (batch_size,), 0, 10)
-
-    with jax.default_device(mlx):
-        params = jax.device_put(params, mlx)
-        x = jax.device_put(x, mlx)
-        y = jax.device_put(y, mlx)
         train_step = create_train_step(model)
 
         # Warmup

@@ -11,9 +11,7 @@ import os
 if "MLX_PJRT_DEBUG" in os.environ:
     del os.environ["MLX_PJRT_DEBUG"]
 if "JAX_PLATFORMS" not in os.environ:
-    os.environ["JAX_PLATFORMS"] = "cpu,mlx"
-elif "cpu" not in os.environ["JAX_PLATFORMS"]:
-    os.environ["JAX_PLATFORMS"] = "cpu," + os.environ["JAX_PLATFORMS"]
+    os.environ["JAX_PLATFORMS"] = "mlx"
 
 import jax
 import jax.numpy as jnp
